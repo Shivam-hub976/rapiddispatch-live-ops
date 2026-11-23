@@ -37,10 +37,13 @@ app.use(express.json({ limit: '16kb' }));
 
 // Health check endpoint (used by Render & monitoring)
 app.get('/api/health', (_req, res) => {
+  const io = app.get('io');
   res.status(200).json({
     status: 'ok',
     service: 'RapidDispatch Live Ops API',
     persistence: isDbConnected() ? 'mongodb-atlas' : 'in-memory-fallback',
+    realtime: io ? 'socket.io-ready' : 'unavailable',
+    activeConnections: io?.engine?.clientsCount ?? 0,
     timestamp: new Date().toISOString(),
   });
 });
