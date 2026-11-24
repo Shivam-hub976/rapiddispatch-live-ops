@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import ticketRoutes from './routes/ticketRoutes.js';
 import { isDbConnected } from './config/db.js';
+import lockManager from './services/lockManager.js';
 
 export const getAllowedOrigins = () => {
   const raw = process.env.CLIENT_URL || 'http://localhost:5173';
@@ -44,6 +45,7 @@ app.get('/api/health', (_req, res) => {
     persistence: isDbConnected() ? 'mongodb-atlas' : 'in-memory-fallback',
     realtime: io ? 'socket.io-ready' : 'unavailable',
     activeConnections: io?.engine?.clientsCount ?? 0,
+    locks: lockManager.getStats(),
     timestamp: new Date().toISOString(),
   });
 });
