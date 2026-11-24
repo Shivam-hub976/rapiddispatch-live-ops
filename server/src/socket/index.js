@@ -8,6 +8,7 @@ import {
 import { sanitizeAgentName, sanitizeTicketId } from '../utils/sanitize.js';
 import defaultLockManager from '../services/lockManager.js';
 import { getTicketById } from '../services/ticketStore.js';
+import { executeTicketResolution } from '../services/resolutionService.js';
 
 const safeAck = (ack, payload) => {
   if (typeof ack === 'function') {
@@ -130,6 +131,12 @@ export const initializeSocketServer = (
 
         // Verify ticket exists and is still open
         const ticket = await getTicketById(ticketId);
+
+        // Guard: abort if the client disconnected during the async DB lookup
+        if (!socket.connected) {
+          return;
+        }
+        
         if (!ticket) {
           const notFound = {
             ok: false,
@@ -254,8 +261,32 @@ export const initializeSocketServer = (
         releasedLock: result.releasedLock,
       });
     });
+    
+    // 4. Resolve a ticket ONLY if this socket owns its active in-memory lock
+    socket.on(CLIENT_EVENTS.RESOLVE_TICKET, async (payload = {}, ack) => {
+     try {
+       const agent = connectedAgents.get(socket.id);
+       const result = await executeTicketResolution({
+       ticketId: payload?.ticketId,
+       resolutionNote: payload?.resolutionNote,
+       socketId: socket.id,
+       agentName: agent?.agentName || payload?.agentName,
+       io,
+       });
 
-    // 4. Disconnect handler (Day 3 Step 3.1 adds automatic Ghost Disconnect ticket release)
+       return safeAck(ack, result);
+     } catch (error) {
+       console.error('[Socket] resolve_ticket error:', error.message);
+       return safeAck(ack, {
+       ok: false,
+       statusCode: 500,
+       code: 'RESOLVE_INTERNAL_ERROR',
+       message: 'Unable to save resolution right now. Please retry.',
+     });
+   }
+ });
+
+    // 5. Disconnect handler (Day 3 Step 3.1 adds automatic Ghost Disconnect ticket release)
     socket.on('disconnect', (reason) => {
       const departedAgent = connectedAgents.get(socket.id);
       connectedAgents.delete(socket.id);

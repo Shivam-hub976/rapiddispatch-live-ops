@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { getAllTickets, getTicketById } from '../services/ticketStore.js';
+import { executeTicketResolution } from '../services/resolutionService.js';
 
 const router = Router();
 
@@ -33,6 +34,35 @@ router.get('/:ticketId', async (req, res, next) => {
     res.status(200).json({
       success: true,
       data: ticket,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PATCH /api/tickets/:ticketId/resolve — Lock-verified resolution endpoint
+router.patch('/:ticketId/resolve', async (req, res, next) => {
+  try {
+    const result = await executeTicketResolution({
+      ticketId: req.params.ticketId,
+      resolutionNote: req.body?.resolutionNote,
+      socketId: req.body?.socketId,
+      agentName: req.body?.agentName,
+      io: req.app.get('io'),
+    });
+
+    if (!result.ok) {
+      return res.status(result.statusCode || 400).json({
+        success: false,
+        code: result.code,
+        message: result.message,
+        lockedBy: result.lockedBy || null,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: result.ticket,
     });
   } catch (error) {
     next(error);
