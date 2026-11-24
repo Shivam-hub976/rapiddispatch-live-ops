@@ -1,6 +1,7 @@
 import { memo } from "react";
 import {
   CheckCircle2,
+  FileEdit,
   Lock,
   MapPin,
   ShieldAlert,
@@ -36,6 +37,7 @@ function TicketCard({
   isPending,
   onLockTicket,
   onUnlockTicket,
+  onOpenWorkspace,
 }) {
   const isResolved = ticket.status === "resolved";
   const isLocked = Boolean(lock) && !isResolved;
@@ -146,15 +148,24 @@ function TicketCard({
             Dispatch Closed
           </div>
         ) : isLockedByMe ? (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <button
+              type="button"
+              onClick={() => onOpenWorkspace(ticket.ticketId)}
+              disabled={!isConnected || isPending}
+              className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-sky-700 px-3 py-2 text-xs font-semibold text-white transition hover:bg-sky-800 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <FileEdit className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Resolve Ticket</span>
+            </button>
             <button
               type="button"
               onClick={() => onUnlockTicket(ticket.ticketId)}
               disabled={!isConnected || isPending}
-              className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-lg border border-sky-700 bg-white px-3 py-2 text-xs font-semibold text-sky-900 transition hover:bg-sky-50 focus:outline-none focus:ring-2 focus:ring-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 transition hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
             >
               <Unlock className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>{isPending ? "Releasing..." : "Release Lock"}</span>
+              <span>{isPending ? "Releasing..." : "Unlock"}</span>
             </button>
           </div>
         ) : isLockedByOther ? (

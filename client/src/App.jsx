@@ -7,6 +7,7 @@ import Header from "./components/Header";
 import MetricsBar from "./components/MetricsBar";
 import FilterBar from "./components/FilterBar";
 import TicketCard from "./components/TicketCard";
+import ResolutionModal from "./components/ResolutionModal";
 import ToastBanner from "./components/ToastBanner";
 
 const getInitialTabAgentName = () => {
@@ -35,6 +36,10 @@ export default function App() {
   // In-memory mirrored lock state: { [ticketId]: { ticketId, socketId, agentName, lockedAt } }
   const [locks, setLocks] = useState({});
   const [pendingTicketIds, setPendingTicketIds] = useState({});
+
+  // Resolution workspace modal state
+  const [activeTicketId, setActiveTicketId] = useState(null);
+  const [isSubmittingResolution, setIsSubmittingResolution] = useState(false);
 
   // Filter & Search state
   const [searchQuery, setSearchQuery] = useState("");
@@ -187,6 +192,12 @@ export default function App() {
           return next;
         });
       }
+
+      if (payload?.ticketId) {
+        setActiveTicketId((current) =>
+          current === payload.ticketId ? null : current,
+        );
+      }
     };
 
     socket.on("connect", handleConnect);
@@ -258,6 +269,7 @@ export default function App() {
 
         if (response?.ok && response.lock) {
           setLocks((prev) => ({ ...prev, [ticketId]: response.lock }));
+          setActiveTicketId(ticketId);
           addToast(`Ticket ${ticketId} locked exclusively for you.`, "success");
         }
       });
@@ -287,12 +299,82 @@ export default function App() {
             delete next[ticketId];
             return next;
           });
+          setActiveTicketId((current) =>
+            current === ticketId ? null : current,
+          );
           addToast(`Ticket ${ticketId} released back to the queue.`, "info");
         } else if (response?.message) {
           addToast(response.message, "warning");
         }
       });
     },
+    [addToast],
+  );
+
+  const handleOpenWorkspace = useCallback((ticketId) => {
+    setActiveTicketId(ticketId);
+  }, []);
+
+  const handleCloseKeepLocked = useCallback(() => {
+    setActiveTicketId(null);
+  }, []);
+
+  const handleSubmitResolution = useCallback(
+    (ticketId, cleanedNote) =>
+      new Promise((resolve) => {
+        if (!socket.connected) {
+          const err = {
+            ok: false,
+            message: "Connection lost. Reconnect before submitting resolution.",
+          };
+          addToast(err.message, "error");
+          resolve(err);
+          return;
+        }
+
+        setIsSubmittingResolution(true);
+
+        socket.emit(
+          CLIENT_EVENTS.RESOLVE_TICKET,
+          {
+            ticketId,
+            resolutionNote: cleanedNote,
+            agentName: agentNameRef.current,
+          },
+          (response) => {
+            setIsSubmittingResolution(false);
+
+            if (response?.ok && response.ticket) {
+              setTickets((prev) =>
+                prev.map((item) =>
+                  item.ticketId === response.ticket.ticketId
+                    ? response.ticket
+                    : item,
+                ),
+              );
+              setLocks((prev) => {
+                if (response.locks && typeof response.locks === "object") {
+                  return response.locks;
+                }
+                const next = { ...prev };
+                delete next[ticketId];
+                return next;
+              });
+              setActiveTicketId(null);
+              addToast(
+                `Ticket ${ticketId} resolved and broadcast to team.`,
+                "success",
+              );
+              resolve({ ok: true });
+            } else {
+              const message =
+                response?.message || "Unable to save resolution. Please retry.";
+              addToast(message, "warning");
+              resolve({ ok: false, message });
+            }
+          },
+        );
+      }),
     [addToast],
   );
 
@@ -350,6 +432,16 @@ export default function App() {
       );
     });
   }, [tickets, locks, searchQuery, statusFilter, priorityFilter]);
+
+  const activeTicket = useMemo(
+    () => tickets.find((item) => item.ticketId === activeTicketId) || null,
+    [tickets, activeTicketId],
+  );
+
+  const activeLock = activeTicket ? locks[activeTicket.ticketId] || null : null;
+  const isActiveLockOwner = Boolean(
+    activeLock && socketId && activeLock.socketId === socketId,
+  );
 
   const isConnected = connectionStatus === "connected";
 
@@ -434,12 +526,27 @@ export default function App() {
                   isPending={Boolean(pendingTicketIds[ticket.ticketId])}
                   onLockTicket={handleLockTicket}
                   onUnlockTicket={handleUnlockTicket}
+                  onOpenWorkspace={handleOpenWorkspace}
                 />
               ))}
             </div>
           )}
         </section>
       </main>
+
+      <ResolutionModal
+        ticket={activeTicket}
+        lock={activeLock}
+        isOwner={isActiveLockOwner}
+        isConnected={isConnected}
+        isSubmitting={isSubmittingResolution}
+        isReleasing={Boolean(
+          activeTicket && pendingTicketIds[activeTicket.ticketId],
+        )}
+        onCloseKeepLocked={handleCloseKeepLocked}
+        onReleaseAndClose={handleUnlockTicket}
+        onSubmitResolution={handleSubmitResolution}
+      />
 
       <ToastBanner toasts={toasts} onDismiss={dismissToast} />
     </div>
