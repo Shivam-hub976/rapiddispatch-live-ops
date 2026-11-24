@@ -1,16 +1,13 @@
-import { useEffect, useState } from "react";
-import {
-  Activity,
-  AlertCircle,
-  RefreshCw,
-  Truck,
-  Users,
-  Wifi,
-  WifiOff,
-} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AlertCircle } from "lucide-react";
 import { socket } from "./socket/socketClient";
 import { CLIENT_EVENTS, SERVER_EVENTS } from "./socket/socketEvents";
 import { fetchTickets } from "./services/ticketApi";
+import Header from "./components/Header";
+import MetricsBar from "./components/MetricsBar";
+import FilterBar from "./components/FilterBar";
+import TicketCard from "./components/TicketCard";
+import ToastBanner from "./components/ToastBanner";
 
 const getInitialTabAgentName = () => {
   const existing = sessionStorage.getItem("rd_agent_name");
@@ -22,24 +19,45 @@ const getInitialTabAgentName = () => {
   return generated;
 };
 
-const PRIORITY_STYLES = {
-  critical: "bg-red-50 text-red-700 border-red-200",
-  high: "bg-amber-50 text-amber-800 border-amber-200",
-  medium: "bg-sky-50 text-sky-800 border-sky-200",
-  low: "bg-slate-100 text-slate-700 border-slate-200",
-};
-
 export default function App() {
-  const [agentName] = useState(getInitialTabAgentName);
+  const [agentName, setAgentName] = useState(getInitialTabAgentName);
+  const agentNameRef = useRef(agentName);
+  agentNameRef.current = agentName;
+
   const [connectionStatus, setConnectionStatus] = useState("connecting");
   const [socketId, setSocketId] = useState("");
   const [activeAgents, setActiveAgents] = useState([]);
+
   const [tickets, setTickets] = useState([]);
   const [loadingTickets, setLoadingTickets] = useState(true);
   const [ticketError, setTicketError] = useState("");
 
-  // Load persisted freight tickets via REST
-  const loadTickets = async () => {
+  // In-memory mirrored lock state: { [ticketId]: { ticketId, socketId, agentName, lockedAt } }
+  const [locks, setLocks] = useState({});
+  const [pendingTicketIds, setPendingTicketIds] = useState({});
+
+  // Filter & Search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [priorityFilter, setPriorityFilter] = useState("all");
+
+  // Toast notifications
+  const [toasts, setToasts] = useState([]);
+
+  const addToast = useCallback((message, tone = "info") => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setToasts((prev) => [...prev.slice(-3), { id, message, tone }]);
+
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((item) => item.id !== id));
+    }, 4500);
+  }, []);
+
+  const dismissToast = useCallback((id) => {
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const loadTickets = useCallback(async () => {
     setLoadingTickets(true);
     setTicketError("");
     try {
@@ -50,22 +68,24 @@ export default function App() {
     } finally {
       setLoadingTickets(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     loadTickets();
-  }, []);
+  }, [loadTickets]);
 
-  // Manage real-time Socket.io lifecycle safely under React Strict Mode
+  // Mount Socket.io listeners once cleanly (Strict Mode safe)
   useEffect(() => {
-    const emitJoinDashboard = () => {
-      socket.emit(CLIENT_EVENTS.JOIN_DASHBOARD, { agentName });
+    const emitJoin = () => {
+      socket.emit(CLIENT_EVENTS.JOIN_DASHBOARD, {
+        agentName: agentNameRef.current,
+      });
     };
 
     const handleConnect = () => {
       setConnectionStatus("connected");
       setSocketId(socket.id || "");
-      emitJoinDashboard();
+      emitJoin();
     };
 
     const handleDisconnect = () => {
@@ -78,8 +98,15 @@ export default function App() {
     };
 
     const handleDashboardJoined = (payload) => {
-      if (payload?.socketId) {
-        setSocketId(payload.socketId);
+      if (payload?.socketId) setSocketId(payload.socketId);
+      if (payload?.locks && typeof payload.locks === "object") {
+        setLocks(payload.locks);
+      }
+    };
+
+    const handleLockStateSync = (payload) => {
+      if (payload?.locks && typeof payload.locks === "object") {
+        setLocks(payload.locks);
       }
     };
 
@@ -89,11 +116,90 @@ export default function App() {
       }
     };
 
+    const handleTicketLocked = (payload) => {
+      if (!payload?.ticketId || !payload?.lock) return;
+      setLocks((prev) => ({
+        ...prev,
+        [payload.ticketId]: payload.lock,
+      }));
+    };
+
+    const handleTicketUnlocked = (payload) => {
+      if (!payload?.ticketId) return;
+      setLocks((prev) => {
+        if (!prev[payload.ticketId]) return prev;
+        const next = { ...prev };
+        delete next[payload.ticketId];
+        return next;
+      });
+    };
+
+    const handleTicketsReleased = (payload) => {
+      if (payload?.locks && typeof payload.locks === "object") {
+        setLocks(payload.locks);
+      } else if (Array.isArray(payload?.releasedTicketIds)) {
+        setLocks((prev) => {
+          const next = { ...prev };
+          for (const ticketId of payload.releasedTicketIds) {
+            delete next[ticketId];
+          }
+          return next;
+        });
+      }
+
+      if (payload?.releasedTicketIds?.length) {
+        addToast(
+          `Auto-unlocked ${payload.releasedTicketIds.join(", ")} after ${
+            payload.agentName || "an agent"
+          } disconnected.`,
+          "info",
+        );
+      }
+    };
+
+    const handleLockRejected = (payload) => {
+      if (payload?.ticketId && payload?.lockedBy) {
+        setLocks((prev) => ({
+          ...prev,
+          [payload.ticketId]: payload.lockedBy,
+        }));
+      }
+      if (payload?.message) {
+        addToast(payload.message, "warning");
+      }
+    };
+
+    const handleTicketResolved = (payload) => {
+      if (payload?.ticket) {
+        setTickets((prev) =>
+          prev.map((item) =>
+            item.ticketId === payload.ticket.ticketId ? payload.ticket : item,
+          ),
+        );
+      }
+
+      if (payload?.locks && typeof payload.locks === "object") {
+        setLocks(payload.locks);
+      } else if (payload?.ticketId) {
+        setLocks((prev) => {
+          const next = { ...prev };
+          delete next[payload.ticketId];
+          return next;
+        });
+      }
+    };
+
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.on("connect_error", handleConnectError);
     socket.on(SERVER_EVENTS.DASHBOARD_JOINED, handleDashboardJoined);
+    socket.on(SERVER_EVENTS.LOCK_STATE_SYNC, handleLockStateSync);
     socket.on(SERVER_EVENTS.ACTIVE_AGENTS_UPDATED, handleActiveAgentsUpdated);
+    socket.on(SERVER_EVENTS.TICKET_LOCKED, handleTicketLocked);
+    socket.on(SERVER_EVENTS.TICKET_UNLOCKED, handleTicketUnlocked);
+    socket.on(SERVER_EVENTS.TICKETS_RELEASED, handleTicketsReleased);
+    socket.on(SERVER_EVENTS.LOCK_REJECTED, handleLockRejected);
+    socket.on(SERVER_EVENTS.TICKET_RESOLVED, handleTicketResolved);
 
     if (socket.connected) {
       handleConnect();
@@ -106,110 +212,191 @@ export default function App() {
       socket.off("disconnect", handleDisconnect);
       socket.off("connect_error", handleConnectError);
       socket.off(SERVER_EVENTS.DASHBOARD_JOINED, handleDashboardJoined);
+      socket.off(SERVER_EVENTS.LOCK_STATE_SYNC, handleLockStateSync);
       socket.off(
         SERVER_EVENTS.ACTIVE_AGENTS_UPDATED,
         handleActiveAgentsUpdated,
       );
+      socket.off(SERVER_EVENTS.TICKET_LOCKED, handleTicketLocked);
+      socket.off(SERVER_EVENTS.TICKET_UNLOCKED, handleTicketUnlocked);
+      socket.off(SERVER_EVENTS.TICKETS_RELEASED, handleTicketsReleased);
+      socket.off(SERVER_EVENTS.LOCK_REJECTED, handleLockRejected);
+      socket.off(SERVER_EVENTS.TICKET_RESOLVED, handleTicketResolved);
     };
-  }, [agentName]);
+  }, [addToast]);
+
+  const handleUpdateAgentName = useCallback(
+    (newName) => {
+      setAgentName(newName);
+      sessionStorage.setItem("rd_agent_name", newName);
+      if (socket.connected) {
+        socket.emit(CLIENT_EVENTS.JOIN_DASHBOARD, { agentName: newName });
+      }
+      addToast(`Signed in as ${newName}.`, "info");
+    },
+    [addToast],
+  );
+
+  const handleLockTicket = useCallback(
+    (ticketId) => {
+      if (!socket.connected) {
+        addToast(
+          "Cannot claim ticket while disconnected from Live Ops.",
+          "error",
+        );
+        return;
+      }
+
+      setPendingTicketIds((prev) => ({ ...prev, [ticketId]: true }));
+
+      socket.emit(CLIENT_EVENTS.LOCK_TICKET, { ticketId }, (response) => {
+        setPendingTicketIds((prev) => {
+          const next = { ...prev };
+          delete next[ticketId];
+          return next;
+        });
+
+        if (response?.ok && response.lock) {
+          setLocks((prev) => ({ ...prev, [ticketId]: response.lock }));
+          addToast(`Ticket ${ticketId} locked exclusively for you.`, "success");
+        }
+      });
+    },
+    [addToast],
+  );
+
+  const handleUnlockTicket = useCallback(
+    (ticketId) => {
+      if (!socket.connected) {
+        addToast("Cannot release lock while disconnected.", "error");
+        return;
+      }
+
+      setPendingTicketIds((prev) => ({ ...prev, [ticketId]: true }));
+
+      socket.emit(CLIENT_EVENTS.UNLOCK_TICKET, { ticketId }, (response) => {
+        setPendingTicketIds((prev) => {
+          const next = { ...prev };
+          delete next[ticketId];
+          return next;
+        });
+
+        if (response?.ok) {
+          setLocks((prev) => {
+            const next = { ...prev };
+            delete next[ticketId];
+            return next;
+          });
+          addToast(`Ticket ${ticketId} released back to the queue.`, "info");
+        } else if (response?.message) {
+          addToast(response.message, "warning");
+        }
+      });
+    },
+    [addToast],
+  );
+
+  // Derived operational metrics
+  const stats = useMemo(() => {
+    let resolved = 0;
+    let locked = 0;
+    let available = 0;
+
+    for (const ticket of tickets) {
+      if (ticket.status === "resolved") {
+        resolved += 1;
+      } else if (locks[ticket.ticketId]) {
+        locked += 1;
+      } else {
+        available += 1;
+      }
+    }
+
+    return { total: tickets.length, available, locked, resolved };
+  }, [tickets, locks]);
+
+  const hasActiveOwnLock = useMemo(
+    () =>
+      Boolean(socketId) &&
+      Object.values(locks).some((lock) => lock.socketId === socketId),
+    [locks, socketId],
+  );
+
+  // Filtered tickets
+  const filteredTickets = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+
+    return tickets.filter((ticket) => {
+      const isResolved = ticket.status === "resolved";
+      const isLocked = Boolean(locks[ticket.ticketId]) && !isResolved;
+
+      if (statusFilter === "available" && (isResolved || isLocked))
+        return false;
+      if (statusFilter === "locked" && !isLocked) return false;
+      if (statusFilter === "resolved" && !isResolved) return false;
+
+      if (priorityFilter !== "all" && ticket.priority !== priorityFilter) {
+        return false;
+      }
+
+      if (!query) return true;
+
+      return (
+        ticket.ticketId.toLowerCase().includes(query) ||
+        ticket.title.toLowerCase().includes(query) ||
+        ticket.customerName.toLowerCase().includes(query) ||
+        ticket.shipmentId.toLowerCase().includes(query) ||
+        ticket.route.toLowerCase().includes(query)
+      );
+    });
+  }, [tickets, locks, searchQuery, statusFilter, priorityFilter]);
 
   const isConnected = connectionStatus === "connected";
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
-      {/* Corporate Operations Header */}
-      <header className="sticky top-0 z-20 border-b border-slate-800 bg-slate-900 text-white shadow-sm">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-4 py-4 sm:px-6 lg:px-8">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-sky-500/15 ring-1 ring-sky-400/30">
-              <Truck className="h-5 w-5 text-sky-400" aria-hidden="true" />
-            </div>
-            <div>
-              <h1 className="text-base font-semibold tracking-tight sm:text-lg">
-                RapidDispatch Live Ops
-              </h1>
-              <p className="text-xs text-slate-300">
-                Dallas Freight Command • Real-Time Support Desk
-              </p>
-            </div>
-          </div>
-
-          <div
-            className="flex flex-wrap items-center gap-2.5 text-xs font-medium"
-            aria-live="polite"
-          >
-            <span
-              className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 ring-1 ${
-                isConnected
-                  ? "bg-emerald-500/15 text-emerald-300 ring-emerald-400/30"
-                  : "bg-amber-500/15 text-amber-200 ring-amber-400/30"
-              }`}
-            >
-              {isConnected ? (
-                <Wifi className="h-3.5 w-3.5" aria-hidden="true" />
-              ) : (
-                <WifiOff className="h-3.5 w-3.5" aria-hidden="true" />
-              )}
-              {isConnected ? "Live Socket Connected" : "Connecting..."}
-            </span>
-
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-800 px-3 py-1.5 text-slate-200 ring-1 ring-slate-700">
-              <Users className="h-3.5 w-3.5 text-sky-400" aria-hidden="true" />
-              {activeAgents.length} Active{" "}
-              {activeAgents.length === 1 ? "Agent" : "Agents"}
-            </span>
-          </div>
-        </div>
-      </header>
+      <Header
+        agentName={agentName}
+        onUpdateAgentName={handleUpdateAgentName}
+        connectionStatus={connectionStatus}
+        activeAgents={activeAgents}
+        hasActiveOwnLock={hasActiveOwnLock}
+      />
 
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-        {/* Session Telemetry Bar */}
-        <section
-          aria-label="Current Agent Session"
-          className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3.5 shadow-xs"
-        >
-          <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
-            <div>
-              <span className="text-slate-500">Signed in as: </span>
-              <span className="font-semibold text-slate-900">{agentName}</span>
-            </div>
-            <div>
-              <span className="text-slate-500">Socket ID: </span>
-              <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-800">
-                {socketId || "Pending handshake..."}
-              </code>
-            </div>
-          </div>
+        <MetricsBar stats={stats} />
 
-          <div className="flex items-center gap-2 text-xs text-slate-600">
-            <Activity className="h-4 w-4 text-emerald-600" aria-hidden="true" />
-            <span>Room: live-ops-dashboard</span>
-          </div>
-        </section>
+        <FilterBar
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          statusFilter={statusFilter}
+          onStatusFilterChange={setStatusFilter}
+          priorityFilter={priorityFilter}
+          onPriorityFilterChange={setPriorityFilter}
+          onRefresh={loadTickets}
+          isRefreshing={loadingTickets}
+        />
 
-        {/* Freight Ticket Queue Preview */}
-        <section aria-labelledby="queue-heading">
-          <div className="mb-4 flex items-center justify-between">
+        <section aria-labelledby="dispatch-queue-heading">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
             <h2
-              id="queue-heading"
-              className="text-lg font-semibold text-slate-900"
+              id="dispatch-queue-heading"
+              className="text-base font-semibold text-slate-900 sm:text-lg"
             >
-              Active Freight Support Queue ({tickets.length})
+              Freight Support Tickets ({filteredTickets.length})
             </h2>
-            <button
-              type="button"
-              onClick={loadTickets}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
-            >
-              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-              Refresh Queue
-            </button>
+            <p className="text-xs text-slate-600">
+              Session ID:{" "}
+              <code className="rounded bg-slate-200/70 px-1.5 py-0.5 font-mono text-slate-800">
+                {socketId || "connecting..."}
+              </code>
+            </p>
           </div>
 
           {ticketError && (
             <div
               role="alert"
-              className="mb-4 flex items-center gap-2.5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
+              className="mb-4 flex items-center gap-2.5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900"
             >
               <AlertCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
               <span>{ticketError}</span>
@@ -221,52 +408,40 @@ export default function App() {
               {Array.from({ length: 6 }).map((_, idx) => (
                 <div
                   key={idx}
-                  className="h-40 animate-pulse rounded-xl border border-slate-200 bg-white p-5"
+                  className="h-56 animate-pulse rounded-xl border border-slate-200 bg-white p-5"
                 />
               ))}
             </div>
+          ) : filteredTickets.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-12 text-center">
+              <p className="text-sm font-semibold text-slate-800">
+                No freight tickets match your current filters.
+              </p>
+              <p className="mt-1 text-xs text-slate-600">
+                Try clearing the search box or switching back to
+                &ldquo;All&rdquo;.
+              </p>
+            </div>
           ) : (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {tickets.map((ticket) => (
-                <article
+              {filteredTickets.map((ticket) => (
+                <TicketCard
                   key={ticket.ticketId}
-                  className="flex flex-col justify-between rounded-xl border border-slate-200 bg-white p-5 shadow-xs transition hover:border-slate-300"
-                >
-                  <div>
-                    <div className="mb-2.5 flex items-center justify-between gap-2">
-                      <span className="font-mono text-xs font-semibold text-slate-600">
-                        {ticket.ticketId} • {ticket.shipmentId}
-                      </span>
-                      <span
-                        className={`rounded-full border px-2.5 py-0.5 text-xs font-semibold capitalize ${
-                          PRIORITY_STYLES[ticket.priority] ||
-                          PRIORITY_STYLES.medium
-                        }`}
-                      >
-                        {ticket.priority}
-                      </span>
-                    </div>
-
-                    <h3 className="mb-1.5 text-sm font-semibold text-slate-900">
-                      {ticket.title}
-                    </h3>
-                    <p className="line-clamp-2 text-xs leading-relaxed text-slate-600">
-                      {ticket.description}
-                    </p>
-                  </div>
-
-                  <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-3 text-xs text-slate-500">
-                    <span className="truncate font-medium text-slate-700">
-                      {ticket.customerName}
-                    </span>
-                    <span className="shrink-0 pl-2">{ticket.route}</span>
-                  </div>
-                </article>
+                  ticket={ticket}
+                  lock={locks[ticket.ticketId] || null}
+                  currentSocketId={socketId}
+                  isConnected={isConnected}
+                  isPending={Boolean(pendingTicketIds[ticket.ticketId])}
+                  onLockTicket={handleLockTicket}
+                  onUnlockTicket={handleUnlockTicket}
+                />
               ))}
             </div>
           )}
         </section>
       </main>
+
+      <ToastBanner toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
