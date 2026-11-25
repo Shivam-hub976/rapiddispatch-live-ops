@@ -4,11 +4,14 @@ import { socket } from "./socket/socketClient";
 import { CLIENT_EVENTS, SERVER_EVENTS } from "./socket/socketEvents";
 import { fetchTickets } from "./services/ticketApi";
 import Header from "./components/Header";
+import ConnectionBanner from "./components/ConnectionBanner";
 import MetricsBar from "./components/MetricsBar";
 import FilterBar from "./components/FilterBar";
 import TicketCard from "./components/TicketCard";
 import ResolutionModal from "./components/ResolutionModal";
 import ToastBanner from "./components/ToastBanner";
+
+const SOCKET_ACK_TIMEOUT_MS = 8000;
 
 const getInitialTabAgentName = () => {
   const existing = sessionStorage.getItem("rd_agent_name");
@@ -25,13 +28,26 @@ export default function App() {
   const agentNameRef = useRef(agentName);
   agentNameRef.current = agentName;
 
-  const [connectionStatus, setConnectionStatus] = useState("connecting");
+  const hasConnectedOnceRef = useRef(false);
+  const ticketsCountRef = useRef(0);
+  const hasTicketErrorRef = useRef(false);
+  const isLoadingTicketsRef = useRef(false);
+
+  const [connectionStatus, setConnectionStatus] = useState(() =>
+    typeof navigator !== "undefined" && !navigator.onLine
+      ? "offline"
+      : "connecting",
+  );
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [socketId, setSocketId] = useState("");
   const [activeAgents, setActiveAgents] = useState([]);
 
   const [tickets, setTickets] = useState([]);
   const [loadingTickets, setLoadingTickets] = useState(true);
   const [ticketError, setTicketError] = useState("");
+
+  ticketsCountRef.current = tickets.length;
+  hasTicketErrorRef.current = Boolean(ticketError);
 
   // In-memory mirrored lock state: { [ticketId]: { ticketId, socketId, agentName, lockedAt } }
   const [locks, setLocks] = useState({});
@@ -62,8 +78,11 @@ export default function App() {
     setToasts((prev) => prev.filter((item) => item.id !== id));
   }, []);
 
-  const loadTickets = useCallback(async () => {
-    setLoadingTickets(true);
+  const loadTickets = useCallback(async ({ silent = false } = {}) => {
+    isLoadingTicketsRef.current = true;
+    if (!silent) {
+      setLoadingTickets(true);
+    }
     setTicketError("");
     try {
       const data = await fetchTickets();
@@ -71,7 +90,10 @@ export default function App() {
     } catch (error) {
       setTicketError(error.message || "Unable to load freight tickets.");
     } finally {
-      setLoadingTickets(false);
+      isLoadingTicketsRef.current = false;
+      if (!silent) {
+        setLoadingTickets(false);
+      }
     }
   }, []);
 
@@ -79,7 +101,7 @@ export default function App() {
     loadTickets();
   }, [loadTickets]);
 
-  // Mount Socket.io listeners once cleanly (Strict Mode safe)
+  // Mount Socket.io & browser network listeners cleanly (Strict Mode safe)
   useEffect(() => {
     const emitJoin = () => {
       socket.emit(CLIENT_EVENTS.JOIN_DASHBOARD, {
@@ -88,18 +110,88 @@ export default function App() {
     };
 
     const handleConnect = () => {
+      const isReconnect = hasConnectedOnceRef.current;
+      hasConnectedOnceRef.current = true;
+
       setConnectionStatus("connected");
+      setReconnectAttempt(0);
       setSocketId(socket.id || "");
       emitJoin();
+
+      // Auto-refresh tickets on reconnect, after an initial load error, or if queue is empty
+      const needsRefresh =
+        isReconnect ||
+        ticketsCountRef.current === 0 ||
+        hasTicketErrorRef.current;
+
+      if (needsRefresh && !isLoadingTicketsRef.current) {
+        loadTickets({ silent: ticketsCountRef.current > 0 });
+      }
+
+      if (isReconnect) {
+        addToast(
+          "Live Ops connection restored — queue and lock states resynchronized.",
+          "success",
+        );
+      }
     };
 
     const handleDisconnect = () => {
-      setConnectionStatus("disconnected");
+      setConnectionStatus(
+        typeof navigator !== "undefined" && !navigator.onLine
+          ? "offline"
+          : "disconnected",
+      );
       setSocketId("");
+      // Prevent buttons from staying stuck if an ACK dropped mid-disconnect
+      setPendingTicketIds({});
+      setIsSubmittingResolution(false);
     };
 
     const handleConnectError = () => {
-      setConnectionStatus("error");
+      setConnectionStatus(
+        typeof navigator !== "undefined" && !navigator.onLine
+          ? "offline"
+          : "error",
+      );
+    };
+
+    const handleReconnectAttempt = (attemptNumber) => {
+      setReconnectAttempt(attemptNumber);
+      setConnectionStatus(
+        typeof navigator !== "undefined" && !navigator.onLine
+          ? "offline"
+          : "reconnecting",
+      );
+    };
+
+    const handleReconnectFailed = () => {
+      setConnectionStatus("failed");
+      addToast(
+        'Automatic reconnection paused. Click "Reconnect Now" when ready.',
+        "error",
+      );
+    };
+
+    const handleBrowserOffline = () => {
+      setConnectionStatus("offline");
+      setPendingTicketIds({});
+      setIsSubmittingResolution(false);
+    };
+
+    const handleBrowserOnline = () => {
+      if (socket.connected) {
+        setConnectionStatus("connected");
+        setReconnectAttempt(0);
+        emitJoin();
+        if (!isLoadingTicketsRef.current) {
+          loadTickets({ silent: ticketsCountRef.current > 0 });
+        }
+        addToast("Back online — Live Ops synchronized.", "success");
+      } else {
+        setConnectionStatus("reconnecting");
+        socket.connect();
+      }
     };
 
     const handleDashboardJoined = (payload) => {
@@ -203,6 +295,8 @@ export default function App() {
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.on("connect_error", handleConnectError);
+    socket.io.on("reconnect_attempt", handleReconnectAttempt);
+    socket.io.on("reconnect_failed", handleReconnectFailed);
     socket.on(SERVER_EVENTS.DASHBOARD_JOINED, handleDashboardJoined);
     socket.on(SERVER_EVENTS.LOCK_STATE_SYNC, handleLockStateSync);
     socket.on(SERVER_EVENTS.ACTIVE_AGENTS_UPDATED, handleActiveAgentsUpdated);
@@ -211,6 +305,9 @@ export default function App() {
     socket.on(SERVER_EVENTS.TICKETS_RELEASED, handleTicketsReleased);
     socket.on(SERVER_EVENTS.LOCK_REJECTED, handleLockRejected);
     socket.on(SERVER_EVENTS.TICKET_RESOLVED, handleTicketResolved);
+
+    window.addEventListener("offline", handleBrowserOffline);
+    window.addEventListener("online", handleBrowserOnline);
 
     if (socket.connected) {
       handleConnect();
@@ -222,6 +319,8 @@ export default function App() {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
       socket.off("connect_error", handleConnectError);
+      socket.io.off("reconnect_attempt", handleReconnectAttempt);
+      socket.io.off("reconnect_failed", handleReconnectFailed);
       socket.off(SERVER_EVENTS.DASHBOARD_JOINED, handleDashboardJoined);
       socket.off(SERVER_EVENTS.LOCK_STATE_SYNC, handleLockStateSync);
       socket.off(
@@ -233,8 +332,18 @@ export default function App() {
       socket.off(SERVER_EVENTS.TICKETS_RELEASED, handleTicketsReleased);
       socket.off(SERVER_EVENTS.LOCK_REJECTED, handleLockRejected);
       socket.off(SERVER_EVENTS.TICKET_RESOLVED, handleTicketResolved);
+
+      window.removeEventListener("offline", handleBrowserOffline);
+      window.removeEventListener("online", handleBrowserOnline);
     };
-  }, [addToast]);
+  }, [addToast, loadTickets]);
+
+  const handleManualReconnect = useCallback(() => {
+    setReconnectAttempt(0);
+    setConnectionStatus("reconnecting");
+    socket.connect();
+    loadTickets({ silent: ticketsCountRef.current > 0 });
+  }, [loadTickets]);
 
   const handleUpdateAgentName = useCallback(
     (newName) => {
@@ -260,19 +369,32 @@ export default function App() {
 
       setPendingTicketIds((prev) => ({ ...prev, [ticketId]: true }));
 
-      socket.emit(CLIENT_EVENTS.LOCK_TICKET, { ticketId }, (response) => {
-        setPendingTicketIds((prev) => {
-          const next = { ...prev };
-          delete next[ticketId];
-          return next;
-        });
+      socket
+        .timeout(SOCKET_ACK_TIMEOUT_MS)
+        .emit(CLIENT_EVENTS.LOCK_TICKET, { ticketId }, (err, response) => {
+          setPendingTicketIds((prev) => {
+            const next = { ...prev };
+            delete next[ticketId];
+            return next;
+          });
 
-        if (response?.ok && response.lock) {
-          setLocks((prev) => ({ ...prev, [ticketId]: response.lock }));
-          setActiveTicketId(ticketId);
-          addToast(`Ticket ${ticketId} locked exclusively for you.`, "success");
-        }
-      });
+          if (err) {
+            addToast(
+              `Lock request for ${ticketId} timed out. Check your connection and retry.`,
+              "error",
+            );
+            return;
+          }
+
+          if (response?.ok && response.lock) {
+            setLocks((prev) => ({ ...prev, [ticketId]: response.lock }));
+            setActiveTicketId(ticketId);
+            addToast(
+              `Ticket ${ticketId} locked exclusively for you.`,
+              "success",
+            );
+          }
+        });
     },
     [addToast],
   );
@@ -286,27 +408,37 @@ export default function App() {
 
       setPendingTicketIds((prev) => ({ ...prev, [ticketId]: true }));
 
-      socket.emit(CLIENT_EVENTS.UNLOCK_TICKET, { ticketId }, (response) => {
-        setPendingTicketIds((prev) => {
-          const next = { ...prev };
-          delete next[ticketId];
-          return next;
-        });
-
-        if (response?.ok) {
-          setLocks((prev) => {
+      socket
+        .timeout(SOCKET_ACK_TIMEOUT_MS)
+        .emit(CLIENT_EVENTS.UNLOCK_TICKET, { ticketId }, (err, response) => {
+          setPendingTicketIds((prev) => {
             const next = { ...prev };
             delete next[ticketId];
             return next;
           });
-          setActiveTicketId((current) =>
-            current === ticketId ? null : current,
-          );
-          addToast(`Ticket ${ticketId} released back to the queue.`, "info");
-        } else if (response?.message) {
-          addToast(response.message, "warning");
-        }
-      });
+
+          if (err) {
+            addToast(
+              `Unlock request for ${ticketId} timed out. Please retry.`,
+              "error",
+            );
+            return;
+          }
+
+          if (response?.ok) {
+            setLocks((prev) => {
+              const next = { ...prev };
+              delete next[ticketId];
+              return next;
+            });
+            setActiveTicketId((current) =>
+              current === ticketId ? null : current,
+            );
+            addToast(`Ticket ${ticketId} released back to the queue.`, "info");
+          } else if (response?.message) {
+            addToast(response.message, "warning");
+          }
+        });
     },
     [addToast],
   );
@@ -334,15 +466,23 @@ export default function App() {
 
         setIsSubmittingResolution(true);
 
-        socket.emit(
+        socket.timeout(SOCKET_ACK_TIMEOUT_MS).emit(
           CLIENT_EVENTS.RESOLVE_TICKET,
           {
             ticketId,
             resolutionNote: cleanedNote,
             agentName: agentNameRef.current,
           },
-          (response) => {
+          (err, response) => {
             setIsSubmittingResolution(false);
+
+            if (err) {
+              const message =
+                "Resolution request timed out. Please verify connection and retry.";
+              addToast(message, "error");
+              resolve({ ok: false, message });
+              return;
+            }
 
             if (response?.ok && response.ticket) {
               setTickets((prev) =>
@@ -455,6 +595,12 @@ export default function App() {
         hasActiveOwnLock={hasActiveOwnLock}
       />
 
+      <ConnectionBanner
+        connectionStatus={connectionStatus}
+        reconnectAttempt={reconnectAttempt}
+        onManualReconnect={handleManualReconnect}
+      />
+
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
         <MetricsBar stats={stats} />
 
@@ -465,7 +611,7 @@ export default function App() {
           onStatusFilterChange={setStatusFilter}
           priorityFilter={priorityFilter}
           onPriorityFilterChange={setPriorityFilter}
-          onRefresh={loadTickets}
+          onRefresh={() => loadTickets()}
           isRefreshing={loadingTickets}
         />
 
