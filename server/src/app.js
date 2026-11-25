@@ -36,6 +36,22 @@ app.use(
 // Body parsing with strict size limit
 app.use(express.json({ limit: '16kb' }));
 
+// Friendly root route for direct browser visits
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    success: true,
+    service: 'RapidDispatch Live Ops API',
+    status: 'running',
+    endpoints: {
+      health: '/api/health',
+      tickets: '/api/tickets',
+    },
+  });
+});
+
+// Silence automatic browser favicon requests
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
+
 // Health check endpoint (used by Render & monitoring)
 app.get('/api/health', (_req, res) => {
   const io = app.get('io');
