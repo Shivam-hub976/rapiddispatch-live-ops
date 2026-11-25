@@ -51,6 +51,9 @@ export const initializeSocketServer = (
       credentials: true,
     },
     transports: ['websocket', 'polling'],
+    // Faster dead-socket detection for abrupt laptop lid closes / network drops
+    pingInterval: 5000,
+    pingTimeout: 4000,
   });
 
   io.on('connection', (socket) => {
@@ -67,7 +70,8 @@ export const initializeSocketServer = (
       const agentRecord = {
         socketId: socket.id,
         agentName,
-        joinedAt: connectedAgents.get(socket.id)?.joinedAt || new Date().toISOString(),
+        joinedAt:
+          connectedAgents.get(socket.id)?.joinedAt || new Date().toISOString(),
       };
       connectedAgents.set(socket.id, agentRecord);
 
@@ -136,7 +140,7 @@ export const initializeSocketServer = (
         if (!socket.connected) {
           return;
         }
-        
+
         if (!ticket) {
           const notFound = {
             ok: false,
@@ -261,39 +265,65 @@ export const initializeSocketServer = (
         releasedLock: result.releasedLock,
       });
     });
-    
+
     // 4. Resolve a ticket ONLY if this socket owns its active in-memory lock
     socket.on(CLIENT_EVENTS.RESOLVE_TICKET, async (payload = {}, ack) => {
-     try {
-       const agent = connectedAgents.get(socket.id);
-       const result = await executeTicketResolution({
-       ticketId: payload?.ticketId,
-       resolutionNote: payload?.resolutionNote,
-       socketId: socket.id,
-       agentName: agent?.agentName || payload?.agentName,
-       io,
-       });
+      try {
+        const agent = connectedAgents.get(socket.id);
+        const result = await executeTicketResolution({
+          ticketId: payload?.ticketId,
+          resolutionNote: payload?.resolutionNote,
+          socketId: socket.id,
+          agentName: agent?.agentName || payload?.agentName,
+          io,
+        });
 
-       return safeAck(ack, result);
-     } catch (error) {
-       console.error('[Socket] resolve_ticket error:', error.message);
-       return safeAck(ack, {
-       ok: false,
-       statusCode: 500,
-       code: 'RESOLVE_INTERNAL_ERROR',
-       message: 'Unable to save resolution right now. Please retry.',
-     });
-   }
- });
+        return safeAck(ack, result);
+      } catch (error) {
+        console.error('[Socket] resolve_ticket error:', error.message);
+        return safeAck(ack, {
+          ok: false,
+          statusCode: 500,
+          code: 'RESOLVE_INTERNAL_ERROR',
+          message: 'Unable to save resolution right now. Please retry.',
+        });
+      }
+    });
 
-    // 5. Disconnect handler (Day 3 Step 3.1 adds automatic Ghost Disconnect ticket release)
+    // 5. Ghost Disconnect Handler — automatically releases all locks held by this socket
     socket.on('disconnect', (reason) => {
       const departedAgent = connectedAgents.get(socket.id);
       connectedAgents.delete(socket.id);
 
-      console.log(
-        `[Socket] Client disconnected: ${socket.id} (${departedAgent?.agentName || 'Unregistered'}) | reason=${reason}`
-      );
+      // O(k) lookup via reverse index in lockManager
+      const releasedLocks = lockManager.releaseAllBySocket(socket.id);
+
+      if (releasedLocks.length > 0) {
+        const releasedTicketIds = releasedLocks.map((lock) => lock.ticketId);
+        const agentName =
+          departedAgent?.agentName ||
+          releasedLocks[0].agentName ||
+          'Unknown Agent';
+
+        console.log(
+          `[Ghost Disconnect] Auto-released [${releasedTicketIds.join(', ')}] from ${agentName} (${socket.id}) | reason=${reason}`
+        );
+
+        // Broadcast release + fresh lock snapshot to all remaining connected clients
+        io.emit(SERVER_EVENTS.TICKETS_RELEASED, {
+          reason,
+          socketId: socket.id,
+          agentName,
+          releasedTicketIds,
+          releasedLocks,
+          locks: lockManager.getAllLocks(),
+          releasedAt: new Date().toISOString(),
+        });
+      } else {
+        console.log(
+          `[Socket] Client disconnected: ${socket.id} (${departedAgent?.agentName || 'Unregistered'}) | reason=${reason}`
+        );
+      }
 
       if (departedAgent) {
         broadcastActiveAgents(io);

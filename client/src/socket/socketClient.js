@@ -14,3 +14,12 @@ export const socket = io(SOCKET_URL, {
   reconnectionDelay: 1000,
   reconnectionDelayMax: 5000,
 });
+
+// Send an immediate clean close frame on tab close/unload (bfcache & Lighthouse safe)
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    if (socket.connected) {
+      socket.disconnect();
+    }
+  });
+}

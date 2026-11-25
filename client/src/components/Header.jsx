@@ -13,6 +13,26 @@ export default function Header({
   const [nameError, setNameError] = useState("");
 
   const isConnected = connectionStatus === "connected";
+  const isOfflineOrFailed =
+    connectionStatus === "offline" ||
+    connectionStatus === "failed" ||
+    connectionStatus === "error";
+
+  const statusLabel = isConnected
+    ? "Live Sync Active"
+    : connectionStatus === "offline"
+      ? "Browser Offline"
+      : connectionStatus === "failed"
+        ? "Server Unreachable"
+        : connectionStatus === "connecting"
+          ? "Connecting..."
+          : "Reconnecting...";
+
+  const statusPillClasses = isConnected
+    ? "bg-emerald-500/15 text-emerald-300 ring-emerald-400/30"
+    : isOfflineOrFailed
+      ? "bg-red-500/15 text-red-200 ring-red-400/30"
+      : "bg-amber-500/15 text-amber-200 ring-amber-400/30";
 
   const handleStartEdit = () => {
     setDraftName(agentName);
@@ -69,18 +89,14 @@ export default function Header({
           <span
             role="status"
             aria-live="polite"
-            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 ring-1 ${
-              isConnected
-                ? "bg-emerald-500/15 text-emerald-300 ring-emerald-400/30"
-                : "bg-amber-500/15 text-amber-200 ring-amber-400/30"
-            }`}
+            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 ring-1 ${statusPillClasses}`}
           >
             {isConnected ? (
               <Wifi className="h-3.5 w-3.5" aria-hidden="true" />
             ) : (
               <WifiOff className="h-3.5 w-3.5" aria-hidden="true" />
             )}
-            <span>{isConnected ? "Live Sync Active" : "Reconnecting..."}</span>
+            <span>{statusLabel}</span>
           </span>
 
           {/* Active Agents Count */}
