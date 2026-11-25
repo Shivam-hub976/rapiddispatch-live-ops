@@ -49,7 +49,7 @@ export default function MetricsBar({ stats }) {
               <p className="mt-1 text-2xl font-bold tracking-tight text-slate-900">
                 {card.value}
               </p>
-              <p className="mt-0.5 text-xs text-slate-500">{card.subtext}</p>
+              <p className="mt-0.5 text-xs text-slate-600">{card.subtext}</p>
             </div>
             <div className={`rounded-lg p-2 ${card.iconClasses}`}>
               <Icon className="h-4 w-4" aria-hidden="true" />

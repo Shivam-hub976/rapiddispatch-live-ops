@@ -712,6 +712,13 @@ export default function App() {
         </section>
       </main>
 
+      <footer className="mt-8 border-t border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-2 px-4 py-4 text-xs text-slate-600 sm:flex-row sm:px-6 lg:px-8">
+          <p>RapidDispatch Freight &amp; Logistics &bull; Dallas, TX</p>
+          <p>Real-Time Concurrency Engine &bull; Socket.io Live Ops</p>
+        </div>
+      </footer>
+
       <ResolutionModal
         key={activeTicket?.ticketId || "closed"}
         ticket={activeTicket}
