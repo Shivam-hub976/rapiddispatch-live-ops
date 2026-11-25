@@ -36,13 +36,6 @@ export default function ResolutionModal({
   const [touched, setTouched] = useState(false);
   const textareaRef = useRef(null);
 
-  // Reset form state whenever a different ticket is opened
-  useEffect(() => {
-    setNote("");
-    setFieldError("");
-    setTouched(false);
-  }, [ticket?.ticketId]);
-
   // Focus textarea on open, handle Escape key, and lock background body scroll
   useEffect(() => {
     if (!ticket) return undefined;

@@ -26,8 +26,6 @@ const getInitialTabAgentName = () => {
 export default function App() {
   const [agentName, setAgentName] = useState(getInitialTabAgentName);
   const agentNameRef = useRef(agentName);
-  agentNameRef.current = agentName;
-
   const hasConnectedOnceRef = useRef(false);
   const ticketsCountRef = useRef(0);
   const hasTicketErrorRef = useRef(false);
@@ -46,9 +44,6 @@ export default function App() {
   const [loadingTickets, setLoadingTickets] = useState(true);
   const [ticketError, setTicketError] = useState("");
 
-  ticketsCountRef.current = tickets.length;
-  hasTicketErrorRef.current = Boolean(ticketError);
-
   // In-memory mirrored lock state: { [ticketId]: { ticketId, socketId, agentName, lockedAt } }
   const [locks, setLocks] = useState({});
   const [pendingTicketIds, setPendingTicketIds] = useState({});
@@ -64,6 +59,13 @@ export default function App() {
 
   // Toast notifications
   const [toasts, setToasts] = useState([]);
+
+  // Keep refs synchronized outside render (React 19 strict-hook compliant)
+  useEffect(() => {
+    agentNameRef.current = agentName;
+    ticketsCountRef.current = tickets.length;
+    hasTicketErrorRef.current = Boolean(ticketError);
+  }, [agentName, tickets.length, ticketError]);
 
   const addToast = useCallback((message, tone = "info") => {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -97,12 +99,38 @@ export default function App() {
     }
   }, []);
 
+  // Initial queue fetch on mount (all setState calls happen asynchronously)
   useEffect(() => {
-    loadTickets();
-  }, [loadTickets]);
+    let isCancelled = false;
+    isLoadingTicketsRef.current = true;
+
+    fetchTickets()
+      .then((data) => {
+        if (!isCancelled) {
+          setTickets(data);
+        }
+      })
+      .catch((error) => {
+        if (!isCancelled) {
+          setTicketError(error.message || "Unable to load freight tickets.");
+        }
+      })
+      .finally(() => {
+        isLoadingTicketsRef.current = false;
+        if (!isCancelled) {
+          setLoadingTickets(false);
+        }
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
 
   // Mount Socket.io & browser network listeners cleanly (Strict Mode safe)
   useEffect(() => {
+    let isActive = true;
+
     const emitJoin = () => {
       socket.emit(CLIENT_EVENTS.JOIN_DASHBOARD, {
         agentName: agentNameRef.current,
@@ -310,12 +338,15 @@ export default function App() {
     window.addEventListener("online", handleBrowserOnline);
 
     if (socket.connected) {
-      handleConnect();
+      queueMicrotask(() => {
+        if (isActive) handleConnect();
+      });
     } else {
       socket.connect();
     }
 
     return () => {
+      isActive = false;
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
       socket.off("connect_error", handleConnectError);
@@ -347,6 +378,7 @@ export default function App() {
 
   const handleUpdateAgentName = useCallback(
     (newName) => {
+      agentNameRef.current = newName;
       setAgentName(newName);
       sessionStorage.setItem("rd_agent_name", newName);
       if (socket.connected) {
@@ -681,6 +713,7 @@ export default function App() {
       </main>
 
       <ResolutionModal
+        key={activeTicket?.ticketId || "closed"}
         ticket={activeTicket}
         lock={activeLock}
         isOwner={isActiveLockOwner}

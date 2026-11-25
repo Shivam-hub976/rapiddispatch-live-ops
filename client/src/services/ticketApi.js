@@ -25,7 +25,10 @@ export const fetchTickets = async ({ timeoutMs = 8000 } = {}) => {
     return payload.data;
   } catch (error) {
     if (error.name === 'AbortError') {
-      throw new Error('Server request timed out. Please verify the backend is running.');
+      throw new Error(
+        'Server request timed out. Please verify the backend is running.',
+        { cause: error }
+      );
     }
     throw error;
   } finally {
